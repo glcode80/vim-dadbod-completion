@@ -361,7 +361,7 @@ function! s:get_scope(buffer, table_scope, type) abort
     return a:table_scope
   endif
 
-  let alias = filter(copy(a:buffer.aliases), 'index(v:val, a:table_scope) > -1')
+  let alias = filter(copy(a:buffer.aliases), 'index(v:val, a:table_scope, 0, 1) > -1')
 
   if empty(alias)
     return ''
