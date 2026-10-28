@@ -11,34 +11,46 @@ local map_kind_to_cmp_lsp_kind = {
 	S = 19, -- Schema   -> Folder
 }
 
--- strict reserved whitelist (single-word)
-local RESERVED_ALLOW = {
-	select = true,
-	with = true,
-	from = true,
-	["order"] = true, -- we also add ORDER BY as multi-word below
-	["group"] = true, -- we also add GROUP BY as multi-word below
-	["join"] = true, -- plus INNER/LEFT/RIGHT JOIN snippets
-	["inner"] = true,
-	["left"] = true,
-	["right"] = true,
-	["create"] = true, -- plus CREATE TABLE snippet
-	["table"] = true,
-	["drop"] = true,
+-- Defaults; override per key via the blink provider's `opts`:
+--   dadbod = { name = "Dadbod", module = "vim_dadbod_completion.blink",
+--              opts = { kinds = { C = true, T = true, R = true, F = true } } }
+local DEFAULTS = {
+	-- Dadbod kinds to show: C column, T table, R reserved word, A alias, S schema, F function
+	kinds = { C = true, T = true, R = true },
+	-- reserved words to keep (lowercase); set to false to keep all of them
+	reserved_allow = {
+		select = true,
+		with = true,
+		from = true,
+		["order"] = true, -- we also add ORDER BY as multi-word below
+		["group"] = true, -- we also add GROUP BY as multi-word below
+		["join"] = true, -- plus INNER/LEFT/RIGHT JOIN snippets
+		["inner"] = true,
+		["left"] = true,
+		["right"] = true,
+		["create"] = true, -- plus CREATE TABLE snippet
+		["table"] = true,
+		["drop"] = true,
+	},
+	-- multi-word keyword snippets we want to propose
+	snippets = {
+		{ label = "ORDER BY", insert = "ORDER BY ", filter = "orderby" },
+		{ label = "GROUP BY", insert = "GROUP BY ", filter = "groupby" },
+		{ label = "INNER JOIN", insert = "INNER JOIN ", filter = "innerjoin" },
+		{ label = "LEFT JOIN", insert = "LEFT JOIN ", filter = "leftjoin" },
+		{ label = "RIGHT JOIN", insert = "RIGHT JOIN ", filter = "rightjoin" },
+		{ label = "CREATE TABLE", insert = "CREATE TABLE ", filter = "createtable" },
+	},
+	score_offset = { C = 80, R = 50, T = 20, A = 10, S = 10, F = 30, snippet = 45 },
 }
 
--- multi-word keyword snippets we want to propose
-local MULTIWORD_SNIPPETS = {
-	{ label = "ORDER BY", insert = "ORDER BY ", filter = "orderby" },
-	{ label = "GROUP BY", insert = "GROUP BY ", filter = "groupby" },
-	{ label = "INNER JOIN", insert = "INNER JOIN ", filter = "innerjoin" },
-	{ label = "LEFT JOIN", insert = "LEFT JOIN ", filter = "leftjoin" },
-	{ label = "RIGHT JOIN", insert = "RIGHT JOIN ", filter = "rightjoin" },
-	{ label = "CREATE TABLE", insert = "CREATE TABLE ", filter = "createtable" },
-}
+-- omni truncates each category to `limit + 1` items (g:vim_dadbod_completion_source_limits)
+local LIMIT_KEY = { C = "columns", T = "tables", S = "schemas", F = "functions", R = "reserved_words" }
 
-function M.new()
-	return setmetatable({}, { __index = M })
+function M.new(opts)
+	local self = setmetatable({}, { __index = M })
+	self.opts = vim.tbl_extend("force", DEFAULTS, opts or {})
+	return self
 end
 
 function M:get_trigger_characters()
@@ -51,7 +63,7 @@ function M:enabled()
 	return vim.tbl_contains(filetypes, vim.bo.filetype)
 end
 
--- ── fuzzy helpers ────────────────────────────────────────────────────────────
+-- ── helpers ──────────────────────────────────────────────────────────────────
 local function strip_quotes(s)
 	if not s or s == "" then
 		return ""
@@ -68,7 +80,7 @@ local function last_segment(s)
 end
 
 local function filter_key(word_or_label)
-	-- blink fuzzy should work on the bare identifier (no schema/alias/quotes)
+	-- blink fuzzy should work on the bare identifier (no schema/quotes)
 	return strip_quotes(last_segment(word_or_label or ""))
 end
 
@@ -76,164 +88,99 @@ local function lower(s)
 	return (s or ""):lower()
 end
 
-local function is_after_dot(ctx, word_start)
-	-- true if the character immediately before the current keyword is '.'
-	if word_start <= 1 then
-		return false
-	end
-	local prev = ctx.line:sub(word_start - 1, word_start - 1)
-	return prev == "."
+local function source_limit(kind)
+	local limits = vim.g.vim_dadbod_completion_source_limits or {}
+	return limits[LIMIT_KEY[kind]] or 200
 end
 
 -- ── main provider ────────────────────────────────────────────────────────────
 function M:get_completions(ctx, callback)
-	local cursor_col = ctx.cursor[2]
-	local line = ctx.line
+	local opts = self.opts
+	local before_cursor = ctx.line:sub(1, ctx.cursor[2])
 
-	-- find start of the current "word"
-	local word_start = cursor_col + 1
-	local triggers = self:get_trigger_characters()
-	while word_start > 1 do
-		local ch = line:sub(word_start - 1, word_start - 1)
-		if vim.tbl_contains(triggers, ch) or ch:match("%s") then
-			break
-		end
-		word_start = word_start - 1
-	end
+	-- The identifier being typed. Taking only the trailing [%w_]* (instead of
+	-- everything back to the last space) means "coalesce(u", "a,b" or "x=u"
+	-- still complete; upstream reset the input to "" there and omni bailed.
+	local input = before_cursor:match("[%w_]*$")
+	local prev_char = before_cursor:sub(-#input - 1, -#input - 1)
+	local after_trigger = vim.tbl_contains(self:get_trigger_characters(), prev_char)
 
-	local input = line:sub(word_start, cursor_col)
-	if input ~= "" and input:match("[^0-9A-Za-z_]+") then
-		-- if it contains strange symbols (not quotes/dot), reset so omni doesn't bail
-		input = ""
-	end
-
-	local after_dot = is_after_dot(ctx, word_start)
-
-	local function done(items)
-		callback({
-			context = ctx,
-			-- let Blink do local fuzzy without re-asking us for each keystroke
-			is_incomplete_forward = false,
-			is_incomplete_backward = false,
-			items = items,
-		})
-	end
-
-	-- call Dadbod omnifunc
 	local ok, results = pcall(vim.api.nvim_call_function, "vim_dadbod_completion#omni", { 0, input })
-	if not ok or not results then
-		done({})
-		return function() end
+	if not ok or type(results) ~= "table" then
+		results = {}
 	end
 
-	-- de-dup by "word+kind" coming from omni
-	local uniq = {}
+	-- de-dup by word+kind (first wins, like upstream) and detect truncation
+	local uniq, order, per_kind = {}, {}, {}
 	for _, it in ipairs(results) do
-		local w = it.word or ""
-		local k = it.kind or ""
-		uniq[w .. "\x1f" .. k] = it
+		local kind = it.kind or ""
+		per_kind[kind] = (per_kind[kind] or 0) + 1
+		local key = (it.word or "") .. "\31" .. kind
+		if not uniq[key] then
+			uniq[key] = it
+			order[#order + 1] = it
+		end
+	end
+	local truncated = false
+	for kind, count in pairs(per_kind) do
+		if LIMIT_KEY[kind] and count > source_limit(kind) then
+			truncated = true
+		end
 	end
 
 	---@type lsp.CompletionItem[]
 	local items = {}
-	local have_column = false
-
-	-- pass 1: transform + filter (!) to keep only Columns / Tables / Whitelisted Reserved
-	for _, it in pairs(uniq) do
+	for _, it in ipairs(order) do
 		local kind = it.kind
 		local label = it.abbr or it.word or ""
 		local insert = it.word or ""
-
-		-- filter out noisy reserved words (DATA, DATABASES, etc.)
-		if kind == "R" then
-			local lw = lower(insert ~= "" and insert or label)
-			if not RESERVED_ALLOW[lw] then
-				goto continue
-			end
-		elseif kind ~= "C" and kind ~= "T" then
-			-- drop everything except Columns/Tables/whitelisted Reserved
-			goto continue
+		local keep = opts.kinds[kind]
+		if keep and kind == "R" and opts.reserved_allow then
+			keep = opts.reserved_allow[lower(insert ~= "" and insert or label)]
 		end
-
-		local fkey = filter_key(insert ~= "" and insert or label)
-		local sort = lower(fkey)
-
-		local score_offset = 0
-		if kind == "C" then
-			score_offset = 80
-			have_column = true
-		elseif kind == "R" then
-			score_offset = 50
-		elseif kind == "T" then
-			score_offset = 20
+		if keep then
+			local fkey = filter_key(insert ~= "" and insert or label)
+			items[#items + 1] = {
+				label = label,
+				insertText = insert,
+				filterText = fkey,
+				sortText = lower(fkey),
+				score_offset = opts.score_offset[kind] or 0,
+				labelDetails = it.menu and { description = it.menu } or nil,
+				documentation = it.info or "",
+				kind = map_kind_to_cmp_lsp_kind[kind] or vim.lsp.protocol.CompletionItemKind.Text,
+			}
 		end
-
-		table.insert(items, {
-			label = label,
-			dup = 0,
-			insertText = insert,
-			filterText = fkey,
-			sortText = sort,
-			score_offset = score_offset,
-			labelDetails = it.menu and { description = it.menu } or nil,
-			documentation = it.info or "",
-			kind = map_kind_to_cmp_lsp_kind[kind] or vim.lsp.protocol.CompletionItemKind.Text,
-		})
-
-		::continue::
 	end
 
-	-- pass 2: add smart multi-word keyword snippets (ranked just below columns)
-	do
+	-- multi-word keyword snippets; never right after "." or a quote
+	if not after_trigger and input ~= "" then
 		local kw = lower(input)
-		for _, snip in ipairs(MULTIWORD_SNIPPETS) do
-			-- show them if there's no keyword yet, or the user started typing any part
-			if kw == "" or snip.filter:find(kw, 1, true) then
-				table.insert(items, {
+		for _, snip in ipairs(opts.snippets) do
+			if snip.filter:find(kw, 1, true) then
+				items[#items + 1] = {
 					label = snip.label,
-					dup = 0,
 					insertText = snip.insert,
 					filterText = snip.filter,
 					sortText = snip.filter,
-					score_offset = 45, -- below columns, roughly with single-word reserved
+					score_offset = opts.score_offset.snippet or 0,
 					kind = vim.lsp.protocol.CompletionItemKind.Keyword,
-				})
+				}
 			end
 		end
 	end
 
-	-- pass 3: when not after a dot, also surface alias-less mirrors of column items
-	-- e.g. DB returns "t.id" -> we additionally show "id" to make fields discoverable earlier.
-	if not after_dot then
-		local seen = {}
-		for _, it in ipairs(items) do
-			if it.kind == vim.lsp.protocol.CompletionItemKind.Field then
-				local lbl = it.label or ""
-				local ins = it.insertText or lbl
-				local has_dot = lbl:find("%.") or ins:find("%.")
-				if has_dot then
-					local bare = filter_key(ins ~= "" and ins or lbl)
-					-- avoid dup if a bare field already exists
-					local key = "bare\31" .. bare
-					if bare ~= "" and not seen[key] then
-						seen[key] = true
-						table.insert(items, {
-							label = bare,
-							dup = 0,
-							insertText = bare,
-							filterText = bare,
-							sortText = lower(bare),
-							score_offset = 78, -- just under the full column entries
-							labelDetails = { description = "column" },
-							kind = vim.lsp.protocol.CompletionItemKind.Field,
-						})
-					end
-				end
-			end
-		end
-	end
-
-	done(items)
+	callback({
+		context = ctx,
+		-- Let blink filter locally while typing, but ask again when omni's list
+		-- was cut at the source limit, or came back empty (columns for "alias."
+		-- are fetched asynchronously the first time; with `false` the empty
+		-- answer would stick until the menu closes).
+		is_incomplete_forward = truncated or #items == 0,
+		-- omni filters by prefix, so a shorter prefix (backspace) needs a re-query
+		is_incomplete_backward = true,
+		items = items,
+	})
 	return function() end
 end
 
